@@ -1,18 +1,12 @@
-"""
-Full FNO Training + Auto Lambda Selection + Train/Test CSV Output
-Corridor Alignment: USGS → Track Chart
-"""
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.signal import find_peaks
 from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 import os
-import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,7 +19,7 @@ os.makedirs(output_path, exist_ok=True)
 
 
 # ============================================================
-# 1. Load & Interpolate
+# 1. Load + Interpolate
 # ============================================================
 def load_and_interpolate(excel_usgs, excel_track, N=4096):
     df1 = pd.read_excel(excel_usgs)
@@ -37,266 +31,228 @@ def load_and_interpolate(excel_usgs, excel_track, N=4096):
     L = min(x1.max(), x2.max())
     x_uniform = np.linspace(0, L, N)
 
-    f1 = interp1d(x1, e1, kind="linear", fill_value="extrapolate")
-    f2 = interp1d(x2, e2, kind="linear", fill_value="extrapolate")
+    f1 = interp1d(x1, e1, fill_value="extrapolate")
+    f2 = interp1d(x2, e2, fill_value="extrapolate")
 
     return x_uniform, f1(x_uniform), f2(x_uniform)
 
 
 # ============================================================
-# 2. Normalization
+# 2. Feature extraction: smoothing + slope + curvature
 # ============================================================
-def normalize_pair(e_usgs_train, e_true_train, e_usgs_test, e_true_test):
-    mean = np.mean(np.concatenate([e_usgs_train, e_true_train]))
-    std = np.std(np.concatenate([e_usgs_train, e_true_train])) + 1e-6
-
-    return (
-        (e_usgs_train - mean) / std,
-        (e_true_train - mean) / std,
-        (e_usgs_test - mean) / std,
-        (e_true_test - mean) / std,
-        mean,
-        std
-    )
+def compute_features(elev, x, sigma=5):
+    elev_s = gaussian_filter1d(elev, sigma=sigma)
+    dx = x[1] - x[0]
+    slope = np.gradient(elev_s, dx)
+    curvature = np.gradient(slope, dx)
+    return elev_s, slope, curvature
 
 
 # ============================================================
-# 3. Keypoints
-# ============================================================
-def extract_keypoints(elevation, thr=0.01):
-    peaks, _ = find_peaks(elevation, prominence=thr)
-    valleys, _ = find_peaks(-elevation, prominence=thr)
-    return np.sort(np.concatenate([peaks, valleys]))
-
-
-# ============================================================
-# 4. FNO1d Definition
+# 3. FNO (safe spectral conv)
 # ============================================================
 class SpectralConv1d(nn.Module):
     def __init__(self, in_ch, out_ch, modes):
         super().__init__()
         self.modes = modes
-        self.scale = 1/(in_ch*out_ch)
+        self.scale = 1/(in_ch * out_ch)
         self.weights = nn.Parameter(
             self.scale * torch.rand(in_ch, out_ch, modes, dtype=torch.cfloat)
         )
 
     def forward(self, x):
-        x_ft = torch.fft.rfft(x)
-        out_ft = torch.zeros(x.size(0), self.weights.size(1), x.size(-1)//2 + 1,
+        B, C, N = x.shape
+        x_ft = torch.fft.rfft(x)                 # [B, C, N//2+1]
+        freq_count = x_ft.shape[-1]
+
+        m = min(self.modes, freq_count)
+        out_ft = torch.zeros(B, self.weights.size(1), freq_count,
                              dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes] = torch.einsum("bix,iox->box",
-                                                 x_ft[:, :, :self.modes], self.weights)
-        return torch.fft.irfft(out_ft, n=x.size(-1))
+
+        w = self.weights[:, :, :m]
+        x_sel = x_ft[:, :, :m]
+        out_ft[:, :, :m] = torch.einsum("bcm, com -> bom", x_sel, w)
+
+        return torch.fft.irfft(out_ft, n=N)
 
 
 class FNO1d(nn.Module):
     def __init__(self, modes=32, width=64, layers=4):
         super().__init__()
-        self.fc0 = nn.Linear(2, width)
+        self.fc0 = nn.Linear(4, width)  # 4 input features
 
-        self.fourier_layers = nn.ModuleList([
-            SpectralConv1d(width, width, modes) for _ in range(layers)
-        ])
-        self.conv_layers = nn.ModuleList([
-            nn.Conv1d(width, width, 1) for _ in range(layers)
-        ])
+        self.f_layers = nn.ModuleList([SpectralConv1d(width, width, modes)
+                                       for _ in range(layers)])
+        self.c_layers = nn.ModuleList([nn.Conv1d(width, width, 1)
+                                       for _ in range(layers)])
 
         self.fc1 = nn.Linear(width, 128)
         self.fc2 = nn.Linear(128, 1)
 
     def forward(self, x):
-        x = self.fc0(x)
-        x = x.permute(0,2,1)
+        x = self.fc0(x)               # [B, N, width]
+        x = x.permute(0, 2, 1)        # [B, width, N]
 
-        for f, c in zip(self.fourier_layers[:-1], self.conv_layers[:-1]):
+        for f, c in zip(self.f_layers, self.c_layers):
             x = F.gelu(f(x) + c(x))
 
-        x = self.fourier_layers[-1](x) + self.conv_layers[-1](x)
-        x = x.permute(0,2,1)
-
+        x = x.permute(0, 2, 1)
         x = F.gelu(self.fc1(x))
         return self.fc2(x).squeeze(-1)
 
 
 # ============================================================
-# 5. Loss Functions
+# 4. Loss functions
 # ============================================================
 def slope_loss(pred, true, dx):
-    return torch.mean((torch.diff(pred)/dx - torch.diff(true)/dx)**2)
+    return torch.mean((torch.gradient(pred, spacing=(dx,))[0] -
+                       torch.gradient(true, spacing=(dx,))[0])**2)
 
-def keypoint_loss(pred, true, kp_idx):
-    return torch.mean((pred[kp_idx] - true[kp_idx])**2)
-
-def frequency_loss(pred, true, k=32):
-    pf, tf = torch.fft.rfft(pred), torch.fft.rfft(true)
-    return torch.mean(torch.abs(pf[:k] - tf[:k])**2)
+def curvature_loss(pred, true, dx):
+    dp = torch.gradient(pred, spacing=(dx,))[0]
+    dt = torch.gradient(true, spacing=(dx,))[0]
+    cp = torch.gradient(dp, spacing=(dx,))[0]
+    ct = torch.gradient(dt, spacing=(dx,))[0]
+    return torch.mean((cp - ct)**2)
 
 def smoothness_loss(pred):
-    d2 = torch.diff(pred, n=2)
+    d2 = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
     return torch.mean(d2**2)
 
 
-# polynomial trend loss
-def trend_loss(pred, true):
-    x = torch.linspace(0, 1, pred.shape[-1], device=pred.device)
-    X = torch.stack([x**3, x**2, x, torch.ones_like(x)], dim=1)
-
-    theta_pred = torch.linalg.lstsq(X, pred.unsqueeze(1)).solution
-    theta_true = torch.linalg.lstsq(X, true.unsqueeze(1)).solution
-    return torch.mean((theta_pred - theta_true)**2)
-
-
 # ============================================================
-# 6. Lambda Auto Tune
+# 5. Prepare train & test
 # ============================================================
-def sample_lambdas():
-    return {
-        "λ_slope": 10**random.uniform(-2, -1),
-        "λ_kp":    10**random.uniform(-3.5, -1.5),
-        "λ_freq":  10**random.uniform(-2.5, -1),
-        "λ_trend": 10**random.uniform(-0.5, 0.5),
-        "λ_smooth":10**random.uniform(-3, -1),
-    }
-
-def short_train_eval(model, X_train, Y_train, kp_idx, dx, lam, steps=80):
-    """Train few steps to evaluate lambda combination"""
-    opt = torch.optim.Adam(model.parameters(), lr=5e-4)
-    for _ in range(steps):
-        opt.zero_grad()
-        pred = model(X_train)
-
-        L = torch.mean((pred - Y_train)**2)
-        L += lam["λ_slope"]  * slope_loss(pred, Y_train, dx)
-        L += lam["λ_kp"]     * keypoint_loss(pred[0], Y_train[0], kp_idx)
-        L += lam["λ_freq"]   * frequency_loss(pred[0], Y_train[0])
-        L += lam["λ_trend"]  * trend_loss(pred[0], Y_train[0])
-        L += lam["λ_smooth"] * smoothness_loss(pred[0])
-
-        L.backward()
-        opt.step()
-
-    # return validation proxy (trend is crucial)
-    with torch.no_grad():
-        final_pred = model(X_train)
-        return float(torch.mean((final_pred - Y_train)**2)
-                     + trend_loss(final_pred[0], Y_train[0]))
-
-
-def find_best_lambdas(X_train, Y_train, kp_idx, dx, trials=12):
-    results = []
-    for i in range(trials):
-        lam = sample_lambdas()
-        model = FNO1d().to(device)
-        score = short_train_eval(model, X_train, Y_train, kp_idx, dx, lam)
-        results.append((score, lam))
-        print(f"Trial {i+1}/{trials}: score={score:.4e}")
-    results.sort(key=lambda x: x[0])
-    return results[0][1]
-
-
-# ============================================================
-# 7. Load Training + Testing Data
-# ============================================================
+N = 4096
 x_train, usgs_train, true_train = load_and_interpolate(
-    data_path + "usgs_elevation_Clovis-Flagstaff_grade_data.xlsx",
-    data_path + "tt_elevation_Clovis-Flagstaff_grade_data.xlsx",
+    data_path+"usgs_elevation_Barstow-LongBeach_grade_data.xlsx",
+    data_path+"tt_elevation_Barstow–LongBeach_grade_data.xlsx",
+    N=N
 )
-
 x_test, usgs_test, true_test = load_and_interpolate(
-    data_path + "usgs_elevation_Amarillo-FortWorth_grade_data.xlsx",
-    data_path + "tt_elevation_Amarillo-FortWorth_grade_data.xlsx",
+    data_path+"usgs_elevation_Barstow–LongBeach_grade_data.xlsx",
+    data_path+"tt_elevation_Barstow–LongBeach_grade_data.xlsx",
+    N=N
 )
 
-usgs_train_n, true_train_n, usgs_test_n, true_test_n, mean_e, std_e = normalize_pair(
-    usgs_train, true_train, usgs_test, true_test
-)
+# feature extraction
+elev_s_train, slope_train, curv_train = compute_features(usgs_train, x_train)
+elev_s_test, slope_test, curv_test = compute_features(usgs_test, x_test)
 
-kp_idx = extract_keypoints(true_train_n)
+# normalization (use training stats)
+mean = true_train.mean()
+std = true_train.std()
+
+# normalized features
+train_feat = np.stack([
+    (elev_s_train - mean) / std,
+    slope_train / (np.std(slope_train) + 1e-6),
+    curv_train / (np.std(curv_train) + 1e-6),
+    x_train / x_train.max(),
+], axis=-1)
+
+test_feat = np.stack([
+    (elev_s_test - mean) / std,
+    slope_test / (np.std(slope_train) + 1e-6),
+    curv_test / (np.std(curv_train) + 1e-6),
+    x_test / x_test.max(),
+], axis=-1)
+
+Y_train = (true_train - mean) / std
+Y_test = (true_test - mean) / std
+
+X_train = torch.tensor(train_feat, dtype=torch.float32).unsqueeze(0).to(device)
+Y_train = torch.tensor(Y_train, dtype=torch.float32).unsqueeze(0).to(device)
+X_test  = torch.tensor(test_feat,  dtype=torch.float32).unsqueeze(0).to(device)
+Y_test  = torch.tensor(Y_test,  dtype=torch.float32).unsqueeze(0).to(device)
+
 dx = x_train[1] - x_train[0]
 
-X_train = torch.tensor(np.stack([usgs_train_n, x_train/x_train.max()], axis=-1),
-                       dtype=torch.float32).unsqueeze(0).to(device)
-Y_train = torch.tensor(true_train_n, dtype=torch.float32).unsqueeze(0).to(device)
-
-X_test = torch.tensor(np.stack([usgs_test_n, x_test/x_test.max()], axis=-1),
-                      dtype=torch.float32).unsqueeze(0).to(device)
-Y_test = torch.tensor(true_test_n, dtype=torch.float32).unsqueeze(0).to(device)
-
 
 # ============================================================
-# 8. Auto Lambda Search
+# 6. Train
 # ============================================================
-print("\n=== Auto-Tuning Lambda Hyperparameters ===")
-best_lam = find_best_lambdas(X_train, Y_train, kp_idx, dx)
-print("\nBest Lambda Set Found:")
-print(best_lam)
-
-
-# ============================================================
-# 9. Full Training using Best λ
-# ============================================================
-print("\n=== Full Training with Best Lambda ===")
-
 model = FNO1d().to(device)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-epochs = 1500
+
+loss_history = []
+epochs = 1000
 
 for ep in range(epochs):
     opt.zero_grad()
     pred = model(X_train)
 
-    L = torch.mean((pred - Y_train)**2)
-    L += best_lam["λ_slope"]  * slope_loss(pred, Y_train, dx)
-    L += best_lam["λ_kp"]     * keypoint_loss(pred[0], Y_train[0], kp_idx)
-    L += best_lam["λ_freq"]   * frequency_loss(pred[0], Y_train[0])
-    L += best_lam["λ_trend"]  * trend_loss(pred[0], Y_train[0])
-    L += best_lam["λ_smooth"] * smoothness_loss(pred[0])
+    L_e = torch.mean((pred - Y_train)**2)
+    L_s = slope_loss(pred[0], Y_train[0], dx)
+    L_c = curvature_loss(pred[0], Y_train[0], dx)
+    L_sm = smoothness_loss(pred)
 
-    L.backward()
+    loss = L_e + 0.1*L_s + 0.02*L_c + 0.001*L_sm
+    loss.backward()
     opt.step()
 
-    if ep % 150 == 0:
-        print(f"Epoch {ep}: loss={L.item():.4e}")
+    loss_history.append(loss.item())
+
+    if ep % 100 == 0:
+        print(f"Epoch {ep}: loss = {loss.item():.6f}")
 
 
 # ============================================================
-# 10. Evaluate + Save Results
+# 7. Evaluate
 # ============================================================
 model.eval()
-train_pred = model(X_train).cpu().detach().numpy()[0] * std_e + mean_e
-test_pred  = model(X_test).cpu().detach().numpy()[0] * std_e + mean_e
+train_pred = model(X_train).detach().cpu().numpy()[0] * std + mean
+test_pred  = model(X_test).detach().cpu().numpy()[0] * std + mean
 
+
+# ============================================================
+# 8. Save CSV
+# ============================================================
 pd.DataFrame({
     "distance_m": x_train,
-    "usgs_elev": usgs_train,
-    "track_true_elev": true_train,
-    "fno_pred_elev": train_pred
-}).to_csv(output_path + "train_results.csv", index=False)
+    "usgs": usgs_train,
+    "tc_true": true_train,
+    "fno_pred": train_pred
+}).to_csv(output_path+"train_results.csv", index=False)
 
 pd.DataFrame({
     "distance_m": x_test,
-    "usgs_elev": usgs_test,
-    "track_true_elev": true_test,
-    "fno_pred_elev": test_pred
-}).to_csv(output_path + "test_results.csv", index=False)
+    "usgs": usgs_test,
+    "tc_true": true_test,
+    "fno_pred": test_pred
+}).to_csv(output_path+"test_results.csv", index=False)
 
 
-# save plots
+# ============================================================
+# 9. Loss plot
+# ============================================================
+plt.figure(figsize=(7,4))
+plt.plot(loss_history)
+plt.title("Training Loss")
+plt.grid()
+plt.savefig(output_path+"training_loss.png", dpi=300)
+plt.close()
+
+
+# ============================================================
+# 10. Plot elevation curves
+# ============================================================
 plt.figure(figsize=(12,5))
-plt.plot(x_train, usgs_train, alpha=0.4)
-plt.plot(x_train, true_train, linewidth=2)
-plt.plot(x_train, train_pred, '--')
-plt.title("Training Alignment (Clovis)")
-plt.savefig(output_path + "train_alignment.png", dpi=300)
+plt.plot(x_train, usgs_train, alpha=0.4, label="USGS")
+plt.plot(x_train, true_train, label="Track Chart", linewidth=2)
+plt.plot(x_train, train_pred, '--', label="FNO Pred")
+plt.legend()
+plt.grid()
+plt.savefig(output_path+"train_alignment.png", dpi=300)
 plt.close()
 
 plt.figure(figsize=(12,5))
-plt.plot(x_test, usgs_test, alpha=0.4)
-plt.plot(x_test, true_test, linewidth=2)
-plt.plot(x_test, test_pred, '--')
-plt.title("Test Alignment (Amarillo)")
-plt.savefig(output_path + "test_alignment.png", dpi=300)
+plt.plot(x_test, usgs_test, alpha=0.4, label="USGS")
+plt.plot(x_test, true_test, label="Track Chart", linewidth=2)
+plt.plot(x_test, test_pred, '--', label="FNO Pred")
+plt.legend()
+plt.grid()
+plt.savefig(output_path+"test_alignment.png", dpi=300)
 plt.close()
 
 print("\nAll results saved!\n")
