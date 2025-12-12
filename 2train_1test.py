@@ -9,16 +9,12 @@ import os, time
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ============================================================
 # Paths
-# ============================================================
 data_path = "/Users/qianqiantong/PycharmProjects/corridor_alignment/corridor_data/"
 output_path = "/Users/qianqiantong/PycharmProjects/corridor_alignment/output/"
 os.makedirs(output_path, exist_ok=True)
 
-# ============================================================
 # 1. Load Corridor with slope + curvature
-# ============================================================
 def load_corridor(excel_usgs, excel_track, N=4096):
     df1 = pd.read_excel(excel_usgs)
     df2 = pd.read_excel(excel_track)
@@ -41,18 +37,13 @@ def load_corridor(excel_usgs, excel_track, N=4096):
 
     return x_uni, usgs, track, slope, curvature
 
-# ============================================================
-# Normalize across corridors
-# ============================================================
 def normalize_multi(arr_list):
     all_values = np.concatenate(arr_list)
     mean = all_values.mean()
     std = all_values.std() + 1e-6
     return [(arr - mean)/std for arr in arr_list], mean, std
 
-# ============================================================
-# 2. FNO Model with safe Fourier
-# ============================================================
+
 class SpectralConv1d(nn.Module):
     def __init__(self, in_ch, out_ch, modes):
         super().__init__()
@@ -105,9 +96,7 @@ class FNO1d(nn.Module):
         x = F.gelu(self.fc1(x))
         return self.fc2(x).squeeze(-1)
 
-# ============================================================
-# 3. Loss Functions
-# ============================================================
+
 def slope_loss(pred, true, dx):
     return ((torch.diff(pred)/dx - torch.diff(true)/dx)**2).mean()
 
@@ -115,9 +104,7 @@ def smoothness_loss(pred):
     d2 = torch.diff(pred, n=2)
     return (d2**2).mean()
 
-# ============================================================
-# 4. Load Training Corridors
-# ============================================================
+
 train_corridors = [
     ("Clovis",
      data_path+"usgs_elevation_Clovis-Flagstaff_grade_data.xlsx",
@@ -134,7 +121,7 @@ test_corridor = (
     data_path+"tt_elevation_Barstow-LongBeach_grade_data.xlsx"
 )
 
-# ---- Load raw data ----
+
 X_raw_list, Y_raw_list, slopes_raw, curv_raw, x_raw = [], [], [], [], []
 for _, usgs_path, track_path in train_corridors:
     x, usgs, track, slope, curv = load_corridor(usgs_path, track_path)
@@ -161,7 +148,6 @@ X_norm_list      = split_norm(X_norm_list, split_sizes)
 slopes_norm_list = split_norm(slopes_norm_list, split_sizes)
 curv_norm_list   = split_norm(curv_norm_list, split_sizes)
 
-# ---- build training tensor ----
 X_train_list, Y_train_list = [], []
 for i in range(len(X_raw_list)):
     xnorm = x_raw[i] / x_raw[i].max()
@@ -175,9 +161,6 @@ Y_train = torch.tensor(np.stack(Y_train_list), dtype=torch.float32).to(device)
 
 dx = x_raw[0][1] - x_raw[0][0]
 
-# ============================================================
-# 5. Load Test Corridor
-# ============================================================
 x_test, usgs_test, true_test, s_test, c_test = load_corridor(
     test_corridor[1], test_corridor[2]
 )
@@ -193,9 +176,7 @@ X_test = torch.tensor(np.stack([
 Y_test = torch.tensor((true_test - mean_e)/std_e,
                       dtype=torch.float32).unsqueeze(0).to(device)
 
-# ============================================================
-# 6. AUTO TUNING λ (slope, smooth)
-# ============================================================
+
 lambda_candidates = []
 lambda_scores = []
 
@@ -247,9 +228,7 @@ plt.ylabel("Score (lower=better)")
 plt.savefig(output_path + "lambda_search_curve.png", dpi=300)
 plt.close()
 
-# ============================================================
-# 7. Training with best λ
-# ============================================================
+# Training with best λ
 model = FNO1d().to(device)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -271,9 +250,8 @@ for ep in range(epochs):
     if ep % 200 == 0:
         print(f"[{ep}] loss = {loss.item():.6f}")
 
-# ============================================================
-# 8. Evaluate, Save Results
-# ============================================================
+
+# Evaluate, Save Results
 model.eval()
 train_pred = model(X_train).cpu().detach().numpy() * std_e + mean_e
 test_pred = model(X_test).cpu().detach().numpy()[0] * std_e + mean_e
